@@ -8,7 +8,7 @@ When a new app starts playing audio, Solo pauses the one that was playing before
 
 Solo watches the system-wide Now Playing state through the private `MediaRemote` framework and keeps a stack of the apps it paused.
 
-- **Play events:** when a different app becomes the Now Playing app and starts playing, the previous app is paused and pushed onto the stack.
+- **Play events:** when a different app becomes the Now Playing app and starts playing, the previous app is paused and pushed onto the stack. Solo first waits up to 3 s for the new app to actually output audio (Core Audio process objects; helper processes such as browser renderers count for their app). Apps that claim Now Playing without making a sound, like muted autoplay videos, don't pause anything.
 - **Pause events:** when the current app stops, the most recently paused app is resumed (after a 1 s debounce, so seeking or buffering doesn't trigger a resume).
 - **Manual override:** if you resume something Solo paused yourself, it is dropped from the stack.
 
@@ -48,6 +48,7 @@ On first use, macOS asks for permission to control Spotify and Music (Automation
 
 - **Now playing / Paused by Solo:** current state and the resume stack
 - **Enabled:** turn Solo on or off
+- **Only pause when the new app makes sound:** the audio check above (on by default)
 - **Experimental: target any app:** use the MediaRemote override for apps without AppleScript support
 - **Forget paused apps:** clear the resume stack
 - **Reset Now Playing override:** clear a stuck override

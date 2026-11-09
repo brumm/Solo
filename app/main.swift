@@ -3,6 +3,7 @@
 // When the new app pauses, the app it interrupted is resumed.
 
 import AppKit
+import CoreAudio
 
 // MARK: - Helper process (MediaRemote via /usr/bin/perl)
 
@@ -91,6 +92,51 @@ func appName(_ bundle: String) -> String {
     return bundle
 }
 
+// MARK: - Audio output (Core Audio process objects)
+
+enum AudioOutput {
+    private typealias ResponsibleFn = @convention(c) (pid_t) -> pid_t
+    /// Maps helper processes (browser renderers, WebKit.GPU, Electron helpers) to their app.
+    private static let responsiblePID: ResponsibleFn? =
+        dlsym(UnsafeMutableRawPointer(bitPattern: -2), "responsibility_get_pid_responsible_for_pid")
+            .map { unsafeBitCast($0, to: ResponsibleFn.self) }
+
+    private static func address(_ sel: AudioObjectPropertySelector) -> AudioObjectPropertyAddress {
+        AudioObjectPropertyAddress(mSelector: sel, mScope: kAudioObjectPropertyScopeGlobal,
+                                   mElement: kAudioObjectPropertyElementMain)
+    }
+
+    private static func get<T: BitwiseCopyable>(_ obj: AudioObjectID, _ sel: AudioObjectPropertySelector, _ initial: T) -> T? {
+        var addr = address(sel)
+        var value = initial
+        var size = UInt32(MemoryLayout<T>.size)
+        return AudioObjectGetPropertyData(obj, &addr, 0, nil, &size, &value) == noErr ? value : nil
+    }
+
+    /// Whether any process belonging to the app is currently running audio output.
+    /// nil if Core Audio can't tell (no process list available).
+    static func isOutputting(bundle: String, pid: pid_t) -> Bool? {
+        var addr = address(kAudioHardwarePropertyProcessObjectList)
+        let system = AudioObjectID(kAudioObjectSystemObject)
+        var size: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(system, &addr, 0, nil, &size) == noErr, size > 0 else { return nil }
+        var ids = [AudioObjectID](repeating: 0, count: Int(size) / MemoryLayout<AudioObjectID>.size)
+        guard AudioObjectGetPropertyData(system, &addr, 0, nil, &size, &ids) == noErr else { return nil }
+
+        var targets = Set(NSRunningApplication.runningApplications(withBundleIdentifier: bundle)
+            .map(\.processIdentifier))
+        if pid > 0 { targets.insert(pid) }
+
+        for id in ids {
+            guard let running: UInt32 = get(id, kAudioProcessPropertyIsRunningOutput, 0), running != 0,
+                  let p: pid_t = get(id, kAudioProcessPropertyPID, 0) else { continue }
+            if targets.contains(p) { return true }
+            if let resp = responsiblePID?(p), targets.contains(resp) { return true }
+        }
+        return false
+    }
+}
+
 // MARK: - Log
 
 final class Log {
@@ -124,12 +170,26 @@ final class Coordinator {
     let helper: Helper
     var enabled = true
     var experimentalTargeting = false
+    /// Only pause the previous app once the new one is actually outputting audio.
+    var requireAudio = true
     var resumeDelay: TimeInterval = 1.0
+    /// How long a new Now Playing app has to start outputting audio.
+    var audioWait: TimeInterval = 3.0
 
     private(set) var current: (bundle: String, playing: Bool)?
     /// Apps Solo paused, most recent last.
     private(set) var pausedStack: [String] = []
     private var pendingResume: DispatchWorkItem?
+    /// A play event waiting for the new app to become audible before pausing `victims`.
+    private struct PendingPause {
+        let id = UUID()
+        let incoming: String
+        let victims: [String]
+    }
+    private var pendingPause: PendingPause?
+    /// Apps that claimed Now Playing without audio; Solo paused nothing for them,
+    /// so their stopping must not trigger a resume.
+    private var silentClaims: Set<String> = []
     var onChange: (() -> Void)?
 
     init(helper: Helper) { self.helper = helper }
@@ -143,7 +203,7 @@ final class Coordinator {
                 current = (bundle, playing)
                 Log.shared.add("after override: \(appName(bundle)) \(playing ? "▶︎" : "⏸")")
             } else {
-                nowPlaying(bundle: bundle, playing: playing)
+                nowPlaying(bundle: bundle, pid: pid_t(event["pid"] as? Int ?? 0), playing: playing)
             }
         case "sendto":
             let b = event["bundle"] as? String ?? "?"
@@ -159,7 +219,7 @@ final class Coordinator {
         onChange?()
     }
 
-    private func nowPlaying(bundle: String, playing: Bool) {
+    private func nowPlaying(bundle: String, pid: pid_t, playing: Bool) {
         let prev = current
         current = (bundle, playing)
         Log.shared.add("now playing: \(appName(bundle)) \(playing ? "▶︎" : "⏸")")
@@ -170,13 +230,30 @@ final class Coordinator {
             pendingResume = nil
             // The user resumed something Solo had paused: it no longer needs resuming.
             pausedStack.removeAll { $0 == bundle }
-            if let prev, prev.bundle != bundle, prev.playing {
-                if control(prev.bundle, .pause) {
-                    pausedStack.removeAll { $0 == prev.bundle }
-                    pausedStack.append(prev.bundle)
-                }
+            silentClaims.remove(bundle)
+            // A superseded pending check still owes its victims a pause.
+            var victims = pendingPause?.victims ?? []
+            pendingPause = nil
+            if let prev, prev.bundle != bundle, prev.playing, !victims.contains(prev.bundle) {
+                victims.append(prev.bundle)
+            }
+            victims.removeAll { $0 == bundle }
+            guard !victims.isEmpty else { return }
+            if requireAudio {
+                let p = PendingPause(incoming: bundle, victims: victims)
+                pendingPause = p
+                checkAudible(p.id, pid: pid, deadline: Date() + audioWait)
+            } else {
+                pause(victims)
             }
         } else {
+            if let p = pendingPause, p.incoming == prev?.bundle {
+                // Stopped before it ever made a sound: nothing was paused, nothing to resume.
+                pendingPause = nil
+                Log.shared.add("\(appName(p.incoming)) stopped before producing audio")
+                return
+            }
+            if let prev, silentClaims.remove(prev.bundle) != nil { return }
             // Something that was playing stopped. It may still be the current app (paused),
             // or it may have left Now Playing entirely (e.g. a video ended), in which case
             // macOS falls back to another app — often the paused one Solo should resume.
@@ -187,6 +264,34 @@ final class Coordinator {
             let work = DispatchWorkItem { [weak self] in self?.resumePrevious(stopped: stopped) }
             pendingResume = work
             DispatchQueue.main.asyncAfter(deadline: .now() + resumeDelay, execute: work)
+        }
+    }
+
+    private func checkAudible(_ id: UUID, pid: pid_t, deadline: Date) {
+        guard let p = pendingPause, p.id == id else { return }
+        let audible = AudioOutput.isOutputting(bundle: p.incoming, pid: pid)
+        if audible != false {
+            pendingPause = nil
+            if audible == nil { Log.shared.add("can't read audio output; pausing without check") }
+            pause(p.victims)
+            onChange?()
+        } else if Date() >= deadline {
+            pendingPause = nil
+            silentClaims.insert(p.incoming)
+            let names = p.victims.map(appName).joined(separator: ", ")
+            Log.shared.add("\(appName(p.incoming)) claimed Now Playing but produced no audio; not pausing \(names)")
+            onChange?()
+        } else {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+                self?.checkAudible(id, pid: pid, deadline: deadline)
+            }
+        }
+    }
+
+    private func pause(_ victims: [String]) {
+        for v in victims where control(v, .pause) {
+            pausedStack.removeAll { $0 == v }
+            pausedStack.append(v)
         }
     }
 
@@ -202,6 +307,8 @@ final class Coordinator {
 
     func forgetPaused() {
         pausedStack.removeAll()
+        pendingPause = nil
+        silentClaims.removeAll()
         onChange?()
     }
 
@@ -240,6 +347,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func applicationDidFinishLaunching(_ note: Notification) {
         coordinator.enabled = defaults.object(forKey: "enabled") as? Bool ?? true
         coordinator.experimentalTargeting = defaults.bool(forKey: "experimentalTargeting")
+        coordinator.requireAudio = defaults.object(forKey: "requireAudio") as? Bool ?? true
 
         let menu = NSMenu()
         menu.delegate = self
@@ -274,6 +382,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(.separator())
 
         menu.addItem(toggle("Enabled", coordinator.enabled, #selector(toggleEnabled)))
+        menu.addItem(toggle("Only pause when the new app makes sound",
+                            coordinator.requireAudio, #selector(toggleRequireAudio)))
         menu.addItem(toggle("Experimental: target any app (MediaRemote override)",
                             coordinator.experimentalTargeting, #selector(toggleExperimental)))
         menu.addItem(item("Forget paused apps", #selector(forget)))
@@ -321,6 +431,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         coordinator.experimentalTargeting.toggle()
         defaults.set(coordinator.experimentalTargeting, forKey: "experimentalTargeting")
         Log.shared.add("experimental targeting \(coordinator.experimentalTargeting ? "on" : "off")")
+    }
+
+    @objc private func toggleRequireAudio() {
+        coordinator.requireAudio.toggle()
+        defaults.set(coordinator.requireAudio, forKey: "requireAudio")
+        Log.shared.add("audio check \(coordinator.requireAudio ? "on" : "off")")
     }
 
     @objc private func forget() { coordinator.forgetPaused() }
